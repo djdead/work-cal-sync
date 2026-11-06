@@ -10,11 +10,12 @@ If you use a self-hosted CalDAV server for your personal calendar and want your 
 - Writes to a dedicated calendar on your CalDAV server using the **caldav** Python library.
 - Syncs with `rsync --delete` semantics: creates new events, updates changed ones, deletes cancelled ones.
 - Runs every 15 minutes via **launchd**. No need to keep Calendar.app open.
+- Runs in its own Python virtualenv, so it never touches your system or Homebrew site-packages. If Python is upgraded or removed (e.g. `brew upgrade` moves you from 3.13 to 3.14), the launcher notices on the next run and rebuilds the environment automatically.
 
 ## Requirements
 
 - macOS 13 (Ventura) or later, Apple Silicon or Intel
-- Python 3.11+ (Homebrew recommended: `brew install python`)
+- Python 3.9+ (Homebrew recommended: `brew install python`)
 - Your work Exchange/O365 account added to macOS via **System Settings → Internet Accounts**
 - A CalDAV server with a dedicated calendar for work events
 
@@ -27,10 +28,25 @@ cd work-cal-sync
 ```
 
 `setup.sh` will:
-1. Install Python dependencies (`pyobjc-framework-EventKit`, `caldav`, `keyring`)
-2. Copy the script to `~/bin/`
-3. Run the interactive setup wizard
-4. Install and load a launchd job to sync every 15 minutes
+1. Copy the script and `requirements.txt` to `~/.local/share/work-cal-sync/`
+2. Install the launcher as `~/bin/work-cal-sync`
+3. Create a private virtualenv in `~/.local/share/work-cal-sync/venv` and install the dependencies into it
+4. Run the interactive setup wizard
+5. Install and load a launchd job to sync every 15 minutes
+
+Re-running `setup.sh` upgrades an existing install in place; your config and Keychain password are kept. To use a specific Python, run `PYTHON=/path/to/python3 ./setup.sh`.
+
+### Python upgrades
+
+launchd runs the launcher (`~/bin/work-cal-sync`), not Python directly. Before each sync the launcher checks that the venv can still import its dependencies. If it can't, the launcher rebuilds the venv, trying in order: the Python `setup.sh` used, then Homebrew's `python3`, then `/usr/bin/python3`. The log records the rebuild. If a rebuild fails (for example, you're offline), the next run tries again.
+
+To force a rebuild yourself:
+
+```bash
+~/bin/work-cal-sync --rebuild
+```
+
+A rebuild can change which Python binary runs the sync. If that happens, macOS may ask again for Calendar access, or the log may show "Calendar access denied". To fix it, allow access in **System Settings → Privacy & Security → Calendars**.
 
 ## First-run setup wizard
 
@@ -41,8 +57,17 @@ On first run you will be prompted to:
 3. **Enter your CalDAV username and password** — password is stored in macOS Keychain, never in the config file
 4. **Choose your target CalDAV calendar** — fetched from your server so you can pick from a list
 5. **Set the sync window** — defaults to 7 days back, 90 days forward
+6. **Attendee blocklist** *(optional)* — a comma-separated list of email addresses. The script skips any event with one of these addresses among its attendees. This is useful when you're a member of a group mailbox or distribution list (e.g. `its-team@example.com`) that gets everyone's PTO and out-of-office invites. Those invites land in your Exchange calendar whether or not you decline them, and Calendar.app often keeps showing them after you've deleted them in Outlook. Leave this empty to sync everything.
 
 Configuration is saved to `~/.config/work-cal-sync/config.json`. To reconfigure, delete that file and re-run the script.
+
+You can edit `exclude_attendee_addresses` in `config.json` directly at any time. It's a JSON array of email addresses, and matching ignores case:
+
+```json
+"exclude_attendee_addresses": ["its-team@example.com", "all-staff@example.com"]
+```
+
+The next sync applies the change. Events already copied to CalDAV that now match the blocklist are deleted from CalDAV on that sync.
 
 ## Logs
 
@@ -54,15 +79,16 @@ Configuration is saved to `~/.config/work-cal-sync/config.json`. To reconfigure,
 
 ```bash
 rm ~/.config/work-cal-sync/config.json
-python3 ~/bin/work-cal-sync.py
+~/bin/work-cal-sync
 ```
 
 ## Uninstall
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/tel.dead.work-cal-sync.plist
+launchctl bootout gui/$(id -u)/tel.dead.work-cal-sync
 rm ~/Library/LaunchAgents/tel.dead.work-cal-sync.plist
-rm ~/bin/work-cal-sync.py
+rm ~/bin/work-cal-sync
+rm -rf ~/.local/share/work-cal-sync
 rm -rf ~/.config/work-cal-sync
 ```
 

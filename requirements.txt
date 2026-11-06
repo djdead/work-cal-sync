@@ -1,0 +1,10 @@
+# Installed into a private venv by setup.sh / the work-cal-sync launcher.
+#
+# caldav and icalendar are pure Python, so capping their major version can't
+# block a Python upgrade; it only protects against API changes.
+# pyobjc and keyring are left uncapped so new Python releases can pick up
+# the versions that support them.
+pyobjc-framework-EventKit>=10.0
+caldav>=1.3,<4
+icalendar>=5.0,<8
+keyring>=24.0

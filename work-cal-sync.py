@@ -11,10 +11,9 @@ Writes to a dedicated CalDAV calendar. Syncs with rsync --delete semantics:
 On first run, an interactive setup wizard configures everything and saves to
 ~/.config/work-cal-sync/config.json. Password is stored in macOS Keychain.
 
-Requirements:
-    pip3 install --break-system-packages pyobjc-framework-EventKit caldav keyring
-
-See setup.sh for automated install.
+Install with setup.sh, which puts this script and its dependencies
+(requirements.txt) in a private virtualenv and runs it through a launcher
+that rebuilds the venv automatically after Python upgrades.
 """
 
 import sys
@@ -32,19 +31,15 @@ KEYCHAIN_SERVICE = "work-cal-sync"
 try:
     import EventKit
     import Foundation
-except ImportError:
-    sys.exit("Missing pyobjc. Run: pip3 install --break-system-packages pyobjc-framework-EventKit")
-
-try:
     import caldav
     from icalendar import Calendar as iCal, Event as iEvent
-except ImportError:
-    sys.exit("Missing caldav. Run: pip3 install --break-system-packages caldav")
-
-try:
     import keyring
-except ImportError:
-    sys.exit("Missing keyring. Run: pip3 install --break-system-packages keyring")
+except ImportError as e:
+    sys.exit(
+        f"Missing dependency: {e}.\n"
+        "Run this script via the launcher (~/bin/work-cal-sync), which manages its\n"
+        "Python environment, or re-run setup.sh from the work-cal-sync repo."
+    )
 
 
 logging.basicConfig(
@@ -112,7 +107,6 @@ def request_eventkit_access(store):
 
 def get_exchange_calendars(store):
     """Return list of (title, source_title, EKCalendar) for Exchange/O365 calendars.
-    macOS registers Exchange/O365 accounts as EKSourceTypeMobileMe (type 1).
     Excludes Birthdays and Holidays calendars.
     """
     calendars = store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
@@ -120,7 +114,7 @@ def get_exchange_calendars(store):
     return [
         (c.title(), c.source().title(), c)
         for c in calendars
-        if c.source().sourceType() == 1
+        if c.source().sourceType() == EventKit.EKSourceTypeExchange
         and c.title().lower() not in exclude
     ]
 
@@ -139,8 +133,32 @@ def nsdate_to_dt(nsdate, all_day=False):
     return dt.date() if all_day else dt
 
 
-def fetch_work_events(store, calendar, days_back, days_forward):
-    """Return {ext_id: EKEvent} for events in the sync window."""
+def normalize_addresses(addresses):
+    """Lowercase, strip and de-duplicate a list of email addresses."""
+    return sorted({a.strip().lower() for a in addresses if a and a.strip()})
+
+
+def event_attendee_addresses(ev):
+    """Return the lowercased email addresses of an EKEvent's attendees."""
+    addresses = []
+    for p in (ev.attendees() or []):
+        url = p.URL()
+        if url is None:
+            continue
+        addr = str(url.absoluteString() if hasattr(url, 'absoluteString') else url)
+        if addr.lower().startswith('mailto:'):
+            addr = addr[len('mailto:'):]
+        addresses.append(addr.lower())
+    return addresses
+
+
+def fetch_work_events(store, calendar, days_back, days_forward, exclude_attendees=()):
+    """Return ({ext_id: EKEvent}, excluded_count) for events in the sync window.
+
+    Events with any attendee in exclude_attendees are skipped. Since they never
+    make it into the result, copies already on the CalDAV server from earlier
+    syncs are removed by sync()'s normal delete pass.
+    """
     now   = datetime.datetime.now()
     start = now - datetime.timedelta(days=days_back)
     end   = now + datetime.timedelta(days=days_forward)
@@ -153,12 +171,19 @@ def fetch_work_events(store, calendar, days_back, days_forward):
     )
     ek_events = store.eventsMatchingPredicate_(predicate) or []
 
+    blocklist = set(normalize_addresses(exclude_attendees))
+
     result = {}
+    excluded = 0
     for ev in ek_events:
         ext_id = ev.calendarItemExternalIdentifier()
-        if ext_id:
-            result[str(ext_id)] = ev
-    return result
+        if not ext_id:
+            continue
+        if blocklist and blocklist.intersection(event_attendee_addresses(ev)):
+            excluded += 1
+            continue
+        result[str(ext_id)] = ev
+    return result, excluded
 
 
 # ── iCalendar building ────────────────────────────────────────────────────────
@@ -170,6 +195,7 @@ def make_ical(ek_event, uid=None):
 
     ev = iEvent()
     ev.add('uid', uid or str(uuid.uuid4()))
+    ev.add('dtstamp', datetime.datetime.now(datetime.timezone.utc))  # required by RFC 5545
     ev.add('summary', str(ek_event.title() or '(No title)'))
 
     all_day = bool(ek_event.isAllDay())
@@ -303,14 +329,24 @@ def setup_wizard(store):
     days_back    = prompt_int("How many days back to sync", 7)
     days_forward = prompt_int("How many days forward to sync", 90)
 
+    # ── Attendee blocklist ─────────────────────────────────────────────────
+    print()
+    print("Optional: skip any event sent to certain addresses, such as a team")
+    print("mailing list whose PTO/out-of-office invites you don't want copied.")
+    raw = input("Comma-separated addresses to exclude [default none]: ")
+    exclude_attendees = normalize_addresses(raw.split(','))
+    if exclude_attendees:
+        print(f"  ✓ Will skip events sent to: {', '.join(exclude_attendees)}")
+
     # ── Save ───────────────────────────────────────────────────────────────
     cfg = {
-        "work_calendar_name":   work_calendar_name,
-        "caldav_server":        caldav_server,
-        "caldav_username":      caldav_user,
-        "caldav_calendar_url":  caldav_calendar_url,
-        "days_back":            days_back,
-        "days_forward":         days_forward,
+        "work_calendar_name":         work_calendar_name,
+        "caldav_server":              caldav_server,
+        "caldav_username":            caldav_user,
+        "caldav_calendar_url":        caldav_calendar_url,
+        "days_back":                  days_back,
+        "days_forward":               days_forward,
+        "exclude_attendee_addresses": exclude_attendees,
     }
     save_config(cfg)
     set_password(caldav_user, caldav_pass)
@@ -352,12 +388,17 @@ def sync(store, cfg):
         sys.exit(1)
 
     log.info("Fetching work events from Calendar.app...")
-    work_events = fetch_work_events(
+    exclude_attendees = normalize_addresses(cfg.get('exclude_attendee_addresses') or [])
+    if exclude_attendees:
+        log.info("Skipping events sent to: %s", ', '.join(exclude_attendees))
+    work_events, excluded = fetch_work_events(
         store, ek_calendar,
         cfg.get('days_back', 7),
         cfg.get('days_forward', 90),
+        exclude_attendees=exclude_attendees,
     )
-    log.info("Found %d work events in sync window.", len(work_events))
+    log.info("Found %d work events in sync window (%d skipped by attendee blocklist).",
+             len(work_events), excluded)
 
     log.info("Fetching events from CalDAV...")
     caldav_events = fetch_radicale_events(caldav_calendar)
