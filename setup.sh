@@ -72,6 +72,14 @@ launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
 echo ""
 echo "  ✓ launchd job loaded; will sync every 15 minutes"
 echo "  Logs: $LOG_FILE"
+
+# Lets macOS ask for notification permission now, rather than at the first
+# real failure (when nobody is around to approve it).
+echo ""
+echo "Sending a test failure-alert notification..."
+"$LAUNCHER" --test-alert 2>/dev/null || true
+echo "  If no notification appeared, allow notifications for Script Editor in"
+echo "  System Settings → Notifications. See \"Failure alerts\" in README.md."
 echo ""
 echo "Installation complete."
 echo ""

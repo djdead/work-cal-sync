@@ -75,6 +75,43 @@ The next sync applies the change. Events already copied to CalDAV that now match
 ~/Library/Logs/work-cal-sync.log
 ```
 
+## Failure alerts
+
+Each sync runs unattended, so a broken sync could otherwise fail quietly for weeks. The launcher keeps track of failed runs, and once syncing has been failing for long enough it alerts you:
+
+- a **macOS notification** (shown via Script Editor, so allow notifications for Script Editor in System Settings → Notifications), and
+- an optional **hook script** you write, for alerts that reach you somewhere else, like your phone.
+
+An alert fires only when **both** of these are true: syncing has been failing for `alert_after_hours` (default 24), **and** the last `alert_min_failures` runs (default 4) all failed. Requiring both prevents false alarms. One failed run on Friday evening plus one right after waking the Mac on Monday (before Wi-Fi reconnects) isn't three days of failure. While syncing keeps failing, the alert repeats every `alert_repeat_hours` (default 24). Once a sync succeeds again, you get one "recovered" notice.
+
+The alert logic runs in the launcher, not in Python, so it still works when Python itself is broken.
+
+To change the thresholds, add any of these to `~/.config/work-cal-sync/config.json`:
+
+```json
+"alert_after_hours": 24,
+"alert_min_failures": 4,
+"alert_repeat_hours": 24
+```
+
+### Alerting to your phone
+
+If `~/.config/work-cal-sync/on-alert` exists and is executable, the launcher runs it with two arguments: the alert kind (`failing`, `recovered` or `test`) and the message. For example, with [ntfy](https://ntfy.sh):
+
+```bash
+#!/bin/bash
+# ~/.config/work-cal-sync/on-alert
+curl -s -H "Title: work-cal-sync $1" -d "$2" https://ntfy.sh/your-private-topic-name
+```
+
+Make it executable with `chmod +x ~/.config/work-cal-sync/on-alert`. The hook should finish quickly; launchd stops anything still running after the sync ends. Test every alert channel with:
+
+```bash
+~/bin/work-cal-sync --test-alert
+```
+
+These alerts can't detect a launchd job that stops running altogether, or a Mac that stays off. If you need to catch that too, have your hook (or a cron job on your server) ping a dead-man's-switch service such as healthchecks.io.
+
 ## Reconfigure
 
 ```bash

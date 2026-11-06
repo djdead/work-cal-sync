@@ -232,13 +232,14 @@ def get_caldav_calendars(url, username, password):
 
 
 def fetch_radicale_events(caldav_calendar):
-    """Return {work_ext_id: (caldav_event, uid, mod_ts)} for all events."""
+    """Return {work_ext_id: (caldav_event, uid, mod_ts)} for all events,
+    or None if the calendar could not be read."""
     managed = {}
     try:
         all_events = caldav_calendar.events()
     except Exception as e:
         log.error("Failed to fetch CalDAV events: %s", e)
-        return managed
+        return None
 
     for ev in all_events:
         try:
@@ -360,6 +361,8 @@ def setup_wizard(store):
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 def sync(store, cfg):
+    """Run one sync. Returns True only if every step succeeded, so the
+    launcher can tell a failing run from a good one."""
     calendars = store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
     ek_calendar = next(
         (c for c in calendars if c.title() == cfg['work_calendar_name']),
@@ -373,6 +376,9 @@ def sync(store, cfg):
 
     password = get_password(cfg['caldav_username'])
     if not password:
+        if not sys.stdin.isatty():
+            sys.exit(f"No CalDAV password for {cfg['caldav_username']} in the Keychain. "
+                     "Run ~/bin/work-cal-sync from Terminal to enter it.")
         password = getpass.getpass(f"CalDAV password for {cfg['caldav_username']}: ")
         set_password(cfg['caldav_username'], password)
 
@@ -402,9 +408,13 @@ def sync(store, cfg):
 
     log.info("Fetching events from CalDAV...")
     caldav_events = fetch_radicale_events(caldav_calendar)
+    if caldav_events is None:
+        # Don't carry on with an empty list: that would re-create every event.
+        log.error("Sync aborted: could not read the CalDAV calendar.")
+        return False
     log.info("Found %d events in CalDAV.", len(caldav_events))
 
-    created = updated = deleted = skipped = 0
+    created = updated = deleted = skipped = failed = 0
 
     for work_id, ek_ev in work_events.items():
         mod_ts = int(nsdate_to_unix(ek_ev.lastModifiedDate()))
@@ -415,6 +425,7 @@ def sync(store, cfg):
                 created += 1
             except Exception as e:
                 log.error("  Failed to create '%s': %s", ek_ev.title(), e)
+                failed += 1
         else:
             rad_ev, existing_uid, stored_mod = caldav_events[work_id]
             if mod_ts > stored_mod:
@@ -425,6 +436,7 @@ def sync(store, cfg):
                     updated += 1
                 except Exception as e:
                     log.error("  Failed to update '%s': %s", ek_ev.title(), e)
+                    failed += 1
             else:
                 skipped += 1
 
@@ -436,9 +448,11 @@ def sync(store, cfg):
                 deleted += 1
             except Exception as e:
                 log.error("  Failed to delete event: %s", e)
+                failed += 1
 
-    log.info("Done — created: %d  updated: %d  deleted: %d  unchanged: %d",
-             created, updated, deleted, skipped)
+    log.info("Done — created: %d  updated: %d  deleted: %d  unchanged: %d  failed: %d",
+             created, updated, deleted, skipped, failed)
+    return failed == 0
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -453,7 +467,7 @@ def main():
     if cfg is None:
         cfg = setup_wizard(store)
 
-    sync(store, cfg)
+    sys.exit(0 if sync(store, cfg) else 1)
 
 
 if __name__ == '__main__':
