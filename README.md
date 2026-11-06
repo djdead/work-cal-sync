@@ -58,6 +58,7 @@ On first run you will be prompted to:
 4. **Choose your target CalDAV calendar** — fetched from your server so you can pick from a list
 5. **Set the sync window** — defaults to 7 days back, 90 days forward
 6. **Attendee blocklist** *(optional)* — a comma-separated list of email addresses. The script skips any event with one of these addresses among its attendees. This is useful when you're a member of a group mailbox or distribution list (e.g. `its-team@example.com`) that gets everyone's PTO and out-of-office invites. Those invites land in your Exchange calendar whether or not you decline them, and Calendar.app often keeps showing them after you've deleted them in Outlook. Leave this empty to sync everything.
+7. **Reminders** *(optional, default off)* — copy each event's Outlook reminder (e.g. "15 minutes before") so devices using your CalDAV calendar alert you for work meetings. Change it later with `"sync_reminders": true` or `false` in `config.json`.
 
 Configuration is saved to `~/.config/work-cal-sync/config.json`. To reconfigure, delete that file and re-run the script.
 
@@ -68,6 +69,39 @@ You can edit `exclude_attendee_addresses` in `config.json` directly at any time.
 ```
 
 The next sync applies the change. Events already copied to CalDAV that now match the blocklist are deleted from CalDAV on that sync.
+
+## What gets copied
+
+For each work event:
+
+- **Title, time, location** and the **original notes** (the Outlook event body).
+- **Join link:** the first Teams, Zoom, Google Meet, Webex, GoTo, Chime or BlueJeans link found in the location, body or event URL. It goes in the event's URL field and on the first line of the description, so phone calendar apps make it tappable. Microsoft 365 "Safe Links" are unwrapped to the real meeting link.
+- **Organizer, attendees and their RSVP status,** listed at the top of the description:
+
+  ```
+  Join: https://teams.microsoft.com/l/meetup-join/...
+  Organizer: Jane Boss
+  Your response: tentative
+  Attendees (5: 2 accepted, 1 tentative, 1 no response, 1 declined):
+    ✓ Amy
+    ✓ Conf Room 4B (room)
+    ? Dead (you)
+    · bob@example.com
+    ✗ Zed
+  ────────
+  (original event body)
+  ```
+
+  Meetings with more than 25 attendees are trimmed, with a count of the rest.
+- **Status:** cancelled meetings are marked cancelled. Meetings you haven't accepted (tentative or no response) are marked tentative.
+- **Free/busy:** events marked *Free* in Outlook don't block time on your CalDAV calendar. The Outlook busy status (busy / free / tentative / out of office) is also kept for clients that understand it.
+- **Reminders,** if `sync_reminders` is on.
+
+Attendees are written as **text in the description**, not as real iCalendar attendees. Many CalDAV servers (Nextcloud, Baikal, SOGo and others) handle meeting invitations themselves. An event with real attendees can make the server email invitations to everyone on it, and make your phone offer RSVP buttons that reply through your personal server instead of Exchange.
+
+RSVP statuses come from Calendar.app's copy of the event, which can lag behind Exchange.
+
+An event is updated on CalDAV whenever anything copied from it changes, including an attendee's response. After upgrading to a version that copies more fields, the first sync rewrites every event once.
 
 ## Logs
 
@@ -152,7 +186,7 @@ This script fills that gap: fully local, no cloud intermediary, no credentials s
 
 - **One-way only** — work → personal CalDAV. Changes made on the CalDAV side are overwritten on the next sync.
 - **Recurring events are copied as individual events** — each occurrence inside the sync window becomes its own event on the CalDAV side, rather than one event with a repeat rule. A moved or cancelled occurrence is updated or removed on the next sync, and new occurrences appear as the window rolls forward.
-- **No attendee/RSVP data** — EventKit exposes attendees but they are not currently written to CalDAV events.
+- **Attendees are informational only** — they're listed in the description, so you can't RSVP from the CalDAV copy. Respond in Outlook.
 - **Exchange Online only** — EWS/on-premises Exchange is not tested but may work since macOS abstracts the protocol.
 - **EWS deprecation** — Microsoft is deprecating EWS for Exchange Online. This script uses EventKit (not EWS directly), so it should be unaffected as long as macOS continues to support Exchange accounts natively.
 
@@ -160,6 +194,5 @@ This script fills that gap: fully local, no cloud intermediary, no credentials s
 
 PRs welcome. Known areas for improvement:
 
-- Attendee/organizer fields
 - Configurable sync interval
 - Tests

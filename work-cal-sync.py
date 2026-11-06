@@ -5,7 +5,7 @@ work-cal-sync — Copy work O365/Exchange calendar events from macOS Calendar.ap
 Reads the work Exchange/O365 calendar via EventKit (macOS manages auth).
 Writes to a dedicated CalDAV calendar. Syncs with rsync --delete semantics:
   - Events in work but not CalDAV → create
-  - Events in both but work is newer → update
+  - Events in both but the copied content differs → update
   - Events in CalDAV but not work → delete
 
 On first run, an interactive setup wizard configures everything and saves to
@@ -22,8 +22,11 @@ import threading
 import datetime
 import logging
 import getpass
+import hashlib
 import uuid
 import os
+import re
+import urllib.parse
 
 CONFIG_PATH = os.path.expanduser("~/.config/work-cal-sync/config.json")
 KEYCHAIN_SERVICE = "work-cal-sync"
@@ -32,7 +35,7 @@ try:
     import EventKit
     import Foundation
     import caldav
-    from icalendar import Calendar as iCal, Event as iEvent
+    from icalendar import Calendar as iCal, Event as iEvent, Alarm as iAlarm
     import keyring
 except ImportError as e:
     sys.exit(
@@ -140,16 +143,7 @@ def normalize_addresses(addresses):
 
 def event_attendee_addresses(ev):
     """Return the lowercased email addresses of an EKEvent's attendees."""
-    addresses = []
-    for p in (ev.attendees() or []):
-        url = p.URL()
-        if url is None:
-            continue
-        addr = str(url.absoluteString() if hasattr(url, 'absoluteString') else url)
-        if addr.lower().startswith('mailto:'):
-            addr = addr[len('mailto:'):]
-        addresses.append(addr.lower())
-    return addresses
+    return [a.lower() for a in map(participant_email, ev.attendees() or []) if a]
 
 
 def sync_key(ev):
@@ -223,16 +217,158 @@ def fetch_work_events(store, calendar, days_back, days_forward, exclude_attendee
     return result, excluded
 
 
+# ── Event metadata ────────────────────────────────────────────────────────────
+
+def _ek(name, default):
+    """An EventKit constant by name, with its documented value as a fallback."""
+    return getattr(EventKit, name, default)
+
+
+# EKParticipantStatus → (sort order, marker, label)
+PARTICIPANT_STATUS = {
+    _ek('EKParticipantStatusAccepted',  2): (0, '✓', 'accepted'),
+    _ek('EKParticipantStatusTentative', 4): (1, '?', 'tentative'),
+    _ek('EKParticipantStatusDelegated', 5): (2, '→', 'delegated'),
+    _ek('EKParticipantStatusDeclined',  3): (4, '✗', 'declined'),
+}
+NO_RESPONSE = (3, '·', 'no response')   # Unknown, Pending, InProcess, Completed
+
+PARTICIPANT_TYPE_ROOM     = _ek('EKParticipantTypeRoom', 2)
+PARTICIPANT_TYPE_RESOURCE = _ek('EKParticipantTypeResource', 3)
+
+EVENT_STATUS_TENTATIVE = _ek('EKEventStatusTentative', 2)
+EVENT_STATUS_CANCELED  = _ek('EKEventStatusCanceled', 3)
+
+AVAILABILITY_BUSY        = _ek('EKEventAvailabilityBusy', 0)
+AVAILABILITY_FREE        = _ek('EKEventAvailabilityFree', 1)
+AVAILABILITY_TENTATIVE   = _ek('EKEventAvailabilityTentative', 2)
+AVAILABILITY_UNAVAILABLE = _ek('EKEventAvailabilityUnavailable', 3)
+
+# Outlook's free/busy values, understood by Outlook-family CalDAV clients.
+CDO_BUSYSTATUS = {
+    AVAILABILITY_BUSY:        'BUSY',
+    AVAILABILITY_FREE:        'FREE',
+    AVAILABILITY_TENTATIVE:   'TENTATIVE',
+    AVAILABILITY_UNAVAILABLE: 'OOF',
+}
+
+MAX_LISTED_ATTENDEES = 25
+
+# Hosts of online-meeting join links, matched against the end of the hostname.
+MEETING_HOSTS = (
+    'teams.microsoft.com', 'teams.live.com',
+    'zoom.us', 'zoomgov.com',
+    'meet.google.com',
+    'webex.com',
+    'gotomeeting.com', 'meet.goto.com',
+    'chime.aws',
+    'bluejeans.com',
+)
+_URL_RE = re.compile(r'https?://[^\s<>"\'\]\[)(]+', re.IGNORECASE)
+
+
+def _unwrap_safelink(url):
+    """Microsoft 365 often rewrites links as Safe Links
+    (https://*.safelinks.protection.outlook.com/?url=<real url>&...)."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname and parts.hostname.endswith('safelinks.protection.outlook.com'):
+        real = urllib.parse.parse_qs(parts.query).get('url')
+        if real:
+            return real[0]
+    return url
+
+
+def find_meeting_link(*texts):
+    """Return the first online-meeting join link (Teams, Zoom, Meet, ...)
+    found in the given texts, or None."""
+    for text in texts:
+        if not text:
+            continue
+        for match in _URL_RE.finditer(str(text)):
+            url = _unwrap_safelink(match.group(0).rstrip('.,;:!>'))
+            host = (urllib.parse.urlsplit(url).hostname or '').lower()
+            if any(host == h or host.endswith('.' + h) for h in MEETING_HOSTS):
+                return url
+    return None
+
+
+def participant_email(p):
+    url = p.URL()
+    if url is None:
+        return ''
+    addr = str(url.absoluteString() if hasattr(url, 'absoluteString') else url)
+    return addr[len('mailto:'):] if addr.lower().startswith('mailto:') else addr
+
+
+def participant_label(p):
+    name = str(p.name() or '').strip()
+    email = participant_email(p)
+    label = name or email or '(unknown)'
+    if p.participantType() in (PARTICIPANT_TYPE_ROOM, PARTICIPANT_TYPE_RESOURCE):
+        label += ' (room)'
+    if p.isCurrentUser():
+        label += ' (you)'
+    return label
+
+
+def my_participant_status(ek_event):
+    """Return the current user's EKParticipantStatus for this event, or None
+    if they aren't listed as an attendee (e.g. their own events)."""
+    for p in (ek_event.attendees() or []):
+        if p.isCurrentUser():
+            return p.participantStatus()
+    return None
+
+
+def meeting_summary(ek_event, join_link):
+    """The text block placed above the original notes in the description."""
+    lines = []
+    if join_link:
+        lines.append(f"Join: {join_link}")
+
+    organizer = ek_event.organizer()
+    if organizer is not None:
+        lines.append(f"Organizer: {'you' if organizer.isCurrentUser() else participant_label(organizer)}")
+
+    mine = my_participant_status(ek_event)
+    if mine is not None and not (organizer is not None and organizer.isCurrentUser()):
+        lines.append(f"Your response: {PARTICIPANT_STATUS.get(mine, NO_RESPONSE)[2]}")
+
+    attendees = [
+        p for p in (ek_event.attendees() or [])
+        if organizer is None or participant_email(p).lower() != participant_email(organizer).lower()
+    ]
+    if attendees:
+        rows = []
+        counts = {}
+        for p in attendees:
+            order, marker, label = PARTICIPANT_STATUS.get(p.participantStatus(), NO_RESPONSE)
+            counts[label] = counts.get(label, 0) + 1
+            rows.append((order, participant_label(p).lower(), f"  {marker} {participant_label(p)}"))
+        rows.sort()   # by response, then name: stable output, so no spurious updates
+
+        tally = ', '.join(
+            f"{counts[label]} {label}"
+            for _, _, label in sorted(list(PARTICIPANT_STATUS.values()) + [NO_RESPONSE])
+            if label in counts
+        )
+        lines.append(f"Attendees ({len(attendees)}: {tally}):")
+        lines.extend(r[2] for r in rows[:MAX_LISTED_ATTENDEES])
+        if len(rows) > MAX_LISTED_ATTENDEES:
+            lines.append(f"  … and {len(rows) - MAX_LISTED_ATTENDEES} more")
+
+    return '\n'.join(lines)
+
+
 # ── iCalendar building ────────────────────────────────────────────────────────
 
-def make_ical(ek_event, key, uid=None):
-    cal = iCal()
-    cal.add('prodid', '-//work-cal-sync//EN')
-    cal.add('version', '2.0')
+def build_vevent(ek_event, key, sync_reminders=False):
+    """Build the VEVENT for an EKEvent, without UID or DTSTAMP.
 
+    Everything in here is derived from the work event, so its serialized form
+    doubles as a fingerprint for change detection (see make_ical).
+    """
     ev = iEvent()
-    ev.add('uid', uid or str(uuid.uuid4()))
-    ev.add('dtstamp', datetime.datetime.now(datetime.timezone.utc))  # required by RFC 5545
     ev.add('summary', str(ek_event.title() or '(No title)'))
 
     all_day = bool(ek_event.isAllDay())
@@ -243,16 +379,75 @@ def make_ical(ek_event, key, uid=None):
     if end:
         ev.add('dtend', end)
 
-    if ek_event.notes():
-        ev.add('description', str(ek_event.notes()))
-    if ek_event.location():
-        ev.add('location', str(ek_event.location()))
+    notes    = str(ek_event.notes() or '').strip()
+    location = str(ek_event.location() or '').strip()
+    event_url = ek_event.URL()
+    event_url = str(event_url.absoluteString()) if event_url is not None else ''
 
-    ev.add('X-WORK-CAL-ID',       key)
-    ev.add('X-WORK-CAL-MODIFIED', str(int(nsdate_to_unix(ek_event.lastModifiedDate()))))
+    join_link = find_meeting_link(location, notes, event_url)
+    url = join_link or event_url
+    if url:
+        ev.add('url', url)
+    if location:
+        ev.add('location', location)
 
+    summary = meeting_summary(ek_event, join_link)
+    description = '\n\n────────\n\n'.join(part for part in (summary, notes) if part)
+    if description:
+        ev.add('description', description)
+
+    # Event status: cancelled meetings, plus anything you haven't accepted.
+    mine = my_participant_status(ek_event)
+    if ek_event.status() == EVENT_STATUS_CANCELED:
+        ev.add('status', 'CANCELLED')
+    elif ek_event.status() == EVENT_STATUS_TENTATIVE or (
+        mine is not None and PARTICIPANT_STATUS.get(mine, NO_RESPONSE)[2] in ('tentative', 'no response')
+    ):
+        ev.add('status', 'TENTATIVE')
+    else:
+        ev.add('status', 'CONFIRMED')
+
+    # Free/busy: only "free" events stop blocking time.
+    availability = ek_event.availability()
+    ev.add('transp', 'TRANSPARENT' if availability == AVAILABILITY_FREE else 'OPAQUE')
+    if availability in CDO_BUSYSTATUS:
+        ev.add('X-MICROSOFT-CDO-BUSYSTATUS', CDO_BUSYSTATUS[availability])
+
+    if sync_reminders:
+        for alarm in (ek_event.alarms() or []):
+            valarm = iAlarm()
+            valarm.add('action', 'DISPLAY')
+            valarm.add('description', str(ek_event.title() or 'Reminder'))
+            if alarm.absoluteDate() is not None:
+                valarm.add('trigger', nsdate_to_dt(alarm.absoluteDate()))
+            else:
+                valarm.add('trigger', datetime.timedelta(seconds=alarm.relativeOffset()))
+            ev.add_component(valarm)
+
+    ev.add('X-WORK-CAL-ID', key)
+    return ev
+
+
+def make_ical(ek_event, key, uid=None, sync_reminders=False):
+    """Return (ics_text, fingerprint) for an EKEvent.
+
+    The fingerprint is a hash of everything copied from the work event. sync()
+    updates the CalDAV copy whenever it changes, which catches changes that
+    don't bump the work event's lastModifiedDate (e.g. attendee responses),
+    and changes in what this script copies.
+    """
+    ev = build_vevent(ek_event, key, sync_reminders)
+    fingerprint = hashlib.sha256(ev.to_ical()).hexdigest()[:16]
+
+    ev.add('uid', uid or str(uuid.uuid4()))
+    ev.add('dtstamp', datetime.datetime.now(datetime.timezone.utc))  # required by RFC 5545
+    ev.add('X-WORK-CAL-HASH', fingerprint)
+
+    cal = iCal()
+    cal.add('prodid', '-//work-cal-sync//EN')
+    cal.add('version', '2.0')
     cal.add_component(ev)
-    return cal.to_ical().decode('utf-8')
+    return cal.to_ical().decode('utf-8'), fingerprint
 
 
 # ── CalDAV ────────────────────────────────────────────────────────────────────
@@ -273,8 +468,9 @@ def get_caldav_calendars(url, username, password):
 
 
 def fetch_radicale_events(caldav_calendar):
-    """Return {work_ext_id: (caldav_event, uid, mod_ts)} for all events,
-    or None if the calendar could not be read."""
+    """Return {work_ext_id: (caldav_event, uid, fingerprint)} for all events,
+    or None if the calendar could not be read. fingerprint is '' for events
+    written by versions before content fingerprints existed."""
     managed = {}
     try:
         all_events = caldav_calendar.events()
@@ -290,9 +486,9 @@ def fetch_radicale_events(caldav_calendar):
                     continue
                 work_id = str(component.get('X-WORK-CAL-ID', ''))
                 uid     = str(component.get('uid', ''))
-                mod     = int(str(component.get('X-WORK-CAL-MODIFIED', 0)))
+                fingerprint = str(component.get('X-WORK-CAL-HASH', ''))
                 if work_id:
-                    managed[work_id] = (ev, uid, mod)
+                    managed[work_id] = (ev, uid, fingerprint)
         except Exception as e:
             log.warning("Could not parse CalDAV event: %s", e)
 
@@ -380,6 +576,12 @@ def setup_wizard(store):
     if exclude_attendees:
         print(f"  ✓ Will skip events sent to: {', '.join(exclude_attendees)}")
 
+    # ── Reminders ──────────────────────────────────────────────────────────
+    print()
+    print("Copy each event's Outlook reminder (e.g. 15 minutes before), so")
+    print("devices using your CalDAV calendar alert you for work meetings?")
+    sync_reminders = input("Copy reminders? [y/N]: ").strip().lower() in ('y', 'yes')
+
     # ── Save ───────────────────────────────────────────────────────────────
     cfg = {
         "work_calendar_name":         work_calendar_name,
@@ -389,6 +591,7 @@ def setup_wizard(store):
         "days_back":                  days_back,
         "days_forward":               days_forward,
         "exclude_attendee_addresses": exclude_attendees,
+        "sync_reminders":             sync_reminders,
     }
     save_config(cfg)
     set_password(caldav_user, caldav_pass)
@@ -457,21 +660,25 @@ def sync(store, cfg):
 
     created = updated = deleted = skipped = failed = 0
 
+    sync_reminders = bool(cfg.get('sync_reminders', False))
+
     for work_id, ek_ev in work_events.items():
-        mod_ts = int(nsdate_to_unix(ek_ev.lastModifiedDate()))
         if work_id not in caldav_events:
             try:
-                caldav_calendar.add_event(make_ical(ek_ev, work_id))
+                ics, _ = make_ical(ek_ev, work_id, sync_reminders=sync_reminders)
+                caldav_calendar.add_event(ics)
                 log.info("  Created: %s", describe(ek_ev))
                 created += 1
             except Exception as e:
                 log.error("  Failed to create '%s': %s", describe(ek_ev), e)
                 failed += 1
         else:
-            rad_ev, existing_uid, stored_mod = caldav_events[work_id]
-            if mod_ts > stored_mod:
+            rad_ev, existing_uid, stored_fingerprint = caldav_events[work_id]
+            ics, fingerprint = make_ical(ek_ev, work_id, uid=existing_uid,
+                                         sync_reminders=sync_reminders)
+            if fingerprint != stored_fingerprint:
                 try:
-                    rad_ev.data = make_ical(ek_ev, work_id, uid=existing_uid)
+                    rad_ev.data = ics
                     rad_ev.save()
                     log.info("  Updated: %s", describe(ek_ev))
                     updated += 1
