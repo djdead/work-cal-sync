@@ -225,8 +225,12 @@ def get_caldav_calendars(url, username, password):
     try:
         client = caldav.DAVClient(url=url, username=username, password=password)
         principal = client.principal()
-        calendars = principal.calendars()
-        return [(c.name, str(c.url)) for c in calendars if c.name]
+        result = []
+        for c in principal.calendars():
+            name = c.get_display_name()
+            if name:
+                result.append((name, str(c.url)))
+        return result
     except Exception as e:
         raise RuntimeError(f"Could not connect to CalDAV server: {e}")
 
