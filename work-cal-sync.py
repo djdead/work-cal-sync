@@ -152,8 +152,41 @@ def event_attendee_addresses(ev):
     return addresses
 
 
+def sync_key(ev):
+    """Return the key that identifies this event on the CalDAV side, or None.
+
+    EventKit expands a recurring series into one EKEvent per occurrence, and
+    every occurrence shares the series' calendarItemExternalIdentifier. Keying
+    on that alone would collapse a weekly meeting into a single event, so
+    occurrences of a recurring series also get the occurrence's original date
+    appended. occurrenceDate() doesn't change when one occurrence is moved, so
+    a moved occurrence is updated in place rather than deleted and re-created.
+
+    Non-recurring events keep the plain identifier, which is what versions
+    before this fix used, so they're not re-created on upgrade.
+    """
+    ext_id = ev.calendarItemExternalIdentifier()
+    if not ext_id:
+        return None
+    ext_id = str(ext_id)
+    if ev.hasRecurrenceRules() or ev.isDetached():
+        occurrence = ev.occurrenceDate() or ev.startDate()
+        return f"{ext_id}#{int(nsdate_to_unix(occurrence))}"
+    return ext_id
+
+
+def describe(ev):
+    """Short human-readable label for log lines: title and local start time."""
+    title = str(ev.title() or '(No title)')
+    start = ev.startDate()
+    if start is None:
+        return title
+    when = datetime.datetime.fromtimestamp(nsdate_to_unix(start))
+    return f"{title} ({when:%a %b %d %H:%M})"
+
+
 def fetch_work_events(store, calendar, days_back, days_forward, exclude_attendees=()):
-    """Return ({ext_id: EKEvent}, excluded_count) for events in the sync window.
+    """Return ({sync_key: EKEvent}, excluded_count) for events in the sync window.
 
     Events with any attendee in exclude_attendees are skipped. Since they never
     make it into the result, copies already on the CalDAV server from earlier
@@ -176,19 +209,23 @@ def fetch_work_events(store, calendar, days_back, days_forward, exclude_attendee
     result = {}
     excluded = 0
     for ev in ek_events:
-        ext_id = ev.calendarItemExternalIdentifier()
-        if not ext_id:
+        key = sync_key(ev)
+        if not key:
             continue
         if blocklist and blocklist.intersection(event_attendee_addresses(ev)):
             excluded += 1
             continue
-        result[str(ext_id)] = ev
+        if key in result:
+            # Two events that would overwrite each other on the CalDAV side.
+            log.warning("Duplicate event key %s: '%s' and '%s'; only one will be synced.",
+                        key, describe(result[key]), describe(ev))
+        result[key] = ev
     return result, excluded
 
 
 # ── iCalendar building ────────────────────────────────────────────────────────
 
-def make_ical(ek_event, uid=None):
+def make_ical(ek_event, key, uid=None):
     cal = iCal()
     cal.add('prodid', '-//work-cal-sync//EN')
     cal.add('version', '2.0')
@@ -211,7 +248,7 @@ def make_ical(ek_event, uid=None):
     if ek_event.location():
         ev.add('location', str(ek_event.location()))
 
-    ev.add('X-WORK-CAL-ID',       str(ek_event.calendarItemExternalIdentifier()))
+    ev.add('X-WORK-CAL-ID',       key)
     ev.add('X-WORK-CAL-MODIFIED', str(int(nsdate_to_unix(ek_event.lastModifiedDate()))))
 
     cal.add_component(ev)
@@ -424,22 +461,22 @@ def sync(store, cfg):
         mod_ts = int(nsdate_to_unix(ek_ev.lastModifiedDate()))
         if work_id not in caldav_events:
             try:
-                caldav_calendar.add_event(make_ical(ek_ev))
-                log.info("  Created: %s", ek_ev.title())
+                caldav_calendar.add_event(make_ical(ek_ev, work_id))
+                log.info("  Created: %s", describe(ek_ev))
                 created += 1
             except Exception as e:
-                log.error("  Failed to create '%s': %s", ek_ev.title(), e)
+                log.error("  Failed to create '%s': %s", describe(ek_ev), e)
                 failed += 1
         else:
             rad_ev, existing_uid, stored_mod = caldav_events[work_id]
             if mod_ts > stored_mod:
                 try:
-                    rad_ev.data = make_ical(ek_ev, uid=existing_uid)
+                    rad_ev.data = make_ical(ek_ev, work_id, uid=existing_uid)
                     rad_ev.save()
-                    log.info("  Updated: %s", ek_ev.title())
+                    log.info("  Updated: %s", describe(ek_ev))
                     updated += 1
                 except Exception as e:
-                    log.error("  Failed to update '%s': %s", ek_ev.title(), e)
+                    log.error("  Failed to update '%s': %s", describe(ek_ev), e)
                     failed += 1
             else:
                 skipped += 1

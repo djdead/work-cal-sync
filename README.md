@@ -151,6 +151,7 @@ This script fills that gap: fully local, no cloud intermediary, no credentials s
 ## Limitations
 
 - **One-way only** — work → personal CalDAV. Changes made on the CalDAV side are overwritten on the next sync.
+- **Recurring events are copied as individual events** — each occurrence inside the sync window becomes its own event on the CalDAV side, rather than one event with a repeat rule. A moved or cancelled occurrence is updated or removed on the next sync, and new occurrences appear as the window rolls forward.
 - **No attendee/RSVP data** — EventKit exposes attendees but they are not currently written to CalDAV events.
 - **Exchange Online only** — EWS/on-premises Exchange is not tested but may work since macOS abstracts the protocol.
 - **EWS deprecation** — Microsoft is deprecating EWS for Exchange Online. This script uses EventKit (not EWS directly), so it should be unaffected as long as macOS continues to support Exchange accounts natively.
@@ -160,6 +161,5 @@ This script fills that gap: fully local, no cloud intermediary, no credentials s
 PRs welcome. Known areas for improvement:
 
 - Attendee/organizer fields
-- Support for recurring event exceptions
 - Configurable sync interval
 - Tests
